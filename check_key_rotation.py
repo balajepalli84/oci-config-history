@@ -1,5 +1,6 @@
 import oci
 import datetime
+import time
 from dateutil import parser
 from datetime import timezone
 
@@ -13,87 +14,110 @@ LOG_STREAM_NAME = "Key_Rotation_Check"
 
 # OCI Clients
 search_client = oci.resource_search.ResourceSearchClient(config)
-base_logging_client = oci.logging.LoggingManagementClient(config)
-logging_composite_client = oci.logging.LoggingManagementClientCompositeOperations(base_logging_client)  # Correct composite client
+logging_mgmt_client = oci.logging.LoggingManagementClient(config)
 logging_client = oci.loggingingestion.LoggingClient(config)
 kms_vault_client = oci.key_management.KmsVaultClient(config)
 
 
+def wait_for_log_group_active(log_group_id, max_wait_seconds=60, wait_interval_seconds=5):
+    elapsed_time = 0
+    while elapsed_time < max_wait_seconds:
+        group = logging_mgmt_client.get_log_group(log_group_id).data
+        if group.lifecycle_state == "ACTIVE":
+            return log_group_id
+        time.sleep(wait_interval_seconds)
+        elapsed_time += wait_interval_seconds
+    raise TimeoutError(f"Log Group {log_group_id} did not become ACTIVE in time.")
+
+
+def wait_for_log_stream_active(log_group_id, log_display_name, max_wait_seconds=60, wait_interval_seconds=5):
+    elapsed_time = 0
+    while elapsed_time < max_wait_seconds:
+        logs = logging_mgmt_client.list_logs(
+            log_group_id=log_group_id,
+            display_name=log_display_name
+        ).data
+        if logs and logs[0].lifecycle_state == "ACTIVE":
+            return logs[0].id
+        time.sleep(wait_interval_seconds)
+        elapsed_time += wait_interval_seconds
+    raise TimeoutError(f"Log Stream '{log_display_name}' did not become ACTIVE in time.")
+
+
 def get_or_create_log_group():
-    groups = base_logging_client.list_log_groups(
-        compartment_id=COMPARTMENT_ID, 
-        display_name=LOG_GROUP_NAME
+    groups = logging_mgmt_client.list_log_groups(COMPARTMENT_ID, display_name=LOG_GROUP_NAME).data
+    if groups:
+        return groups[0].id
+
+    group = logging_mgmt_client.create_log_group(
+        oci.logging.models.CreateLogGroupDetails(
+            compartment_id=COMPARTMENT_ID,
+            display_name=LOG_GROUP_NAME
+        )
     ).data
 
-    if groups:
-        group = groups[0]
-        if group.lifecycle_state == "ACTIVE":
-            print(f"Log group {LOG_GROUP_NAME} already exists with ID: {group.id}",flush=True)
-            return group.id
-            
-        response = oci.wait_until(
-            base_logging_client,
-            base_logging_client.get_log_group(group.id),
-            evaluate_response=lambda r: r.data.lifecycle_state == 'ACTIVE',
-            max_wait_seconds=30
-        )
-        return response.data.id
+    # Wait and poll every 30 seconds until lifecycle_state is ACTIVE
+    max_wait_seconds = 300  # 5 minutes max wait
+    waited_seconds = 0
 
-    # Create new log group with composite client waiter
-    create_details = oci.logging.models.CreateLogGroupDetails(
-        compartment_id=COMPARTMENT_ID,
-        display_name=LOG_GROUP_NAME
-    )
-    print(f"Creating log group {LOG_GROUP_NAME}...",flush=True)
-    response = logging_composite_client.create_log_group_and_wait_for_state(
-        create_details,
-        wait_for_states=['ACTIVE'],
-        waiter_kwargs={'max_wait_seconds': 300}
-    )
-    return response.data.id
+    while waited_seconds < max_wait_seconds:
+        time.sleep(30)
+        waited_seconds += 30
+        groups = logging_mgmt_client.list_log_groups(COMPARTMENT_ID, display_name=LOG_GROUP_NAME).data
+        if groups and groups[0].lifecycle_state == "ACTIVE":
+            return groups[0].id
+        print(f"Waiting for Log Group '{LOG_GROUP_NAME}' to become ACTIVE...")
+
+    raise TimeoutError("Log Group did not become ACTIVE within expected time.")
 
 def get_or_create_log_stream(log_group_id):
-    streams = base_logging_client.list_logs(
-        log_group_id=log_group_id, 
-        display_name=LOG_STREAM_NAME
+    streams = logging_mgmt_client.list_logs(log_group_id, display_name=LOG_STREAM_NAME).data
+    if streams:
+        return streams[0].id
+
+    stream = logging_mgmt_client.create_log(
+        log_group_id,
+        oci.logging.models.CreateLogDetails(
+            display_name=LOG_STREAM_NAME,
+            log_type="CUSTOM"
+        )
     ).data
 
-    if streams:
-        stream = streams[0]
-        if stream.lifecycle_state == "ACTIVE":
-            return stream.id
-        response = oci.wait_until(
-            base_logging_client,
-            base_logging_client.get_log(stream.id),
-            evaluate_response=lambda r: r.data.lifecycle_state == 'ACTIVE',
-            max_wait_seconds=300
-        )
-        return response.data.id
+    # Wait and poll every 30 seconds until lifecycle_state is ACTIVE
+    max_wait_seconds = 300  # 5 minutes max wait
+    waited_seconds = 0
 
-    # Create new log stream with composite client waiter
-    create_details = oci.logging.models.CreateLogDetails(
-        display_name=LOG_STREAM_NAME,
-        log_type="CUSTOM"
-    )
-    print(f"Creating log stream {LOG_STREAM_NAME}...",flush=True)
-    response = logging_composite_client.create_log_and_wait_for_state(
-        log_group_id,
-        create_details,
-        wait_for_states=['ACTIVE'],
-        waiter_kwargs={'max_wait_seconds': 30}
-    )
-    return response.data.id
+    while waited_seconds < max_wait_seconds:
+        time.sleep(30)
+        waited_seconds += 30
+        streams = logging_mgmt_client.list_logs(log_group_id, display_name=LOG_STREAM_NAME).data
+        if streams and streams[0].lifecycle_state == "ACTIVE":
+            return streams[0].id
+        print(f"Waiting for Log Stream '{LOG_STREAM_NAME}' to become ACTIVE...")
+
+    raise TimeoutError("Log Stream did not become ACTIVE within expected time.")
 
 
-def log_event(log_stream_id, message):
+
+def log_event(log_stream_id, message, start_time=None):
     current_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+    
+    # Calculate runtime if start_time is provided
+    runtime_info = ""
+    if start_time:
+        elapsed_seconds = (datetime.datetime.utcnow() - start_time).total_seconds()
+        runtime_info = f"\nRuntime (seconds): {elapsed_seconds}"
+
+    # Prepend timestamp and runtime to the message
+    final_message = f"ExecutedTime: {current_time.isoformat()}Z{runtime_info}\n{message}"
+
     log_entry = oci.loggingingestion.models.PutLogsDetails(
         specversion="1.0",
         log_entry_batches=[
             oci.loggingingestion.models.LogEntryBatch(
                 entries=[
                     oci.loggingingestion.models.LogEntry(
-                        data=message,
+                        data=final_message,
                         id=str(current_time.timestamp()),
                         time=current_time
                     )
@@ -105,7 +129,9 @@ def log_event(log_stream_id, message):
             )
         ]
     )
+
     logging_client.put_logs(log_stream_id, log_entry)
+
 
 
 def get_key_version_creation_time(key_ocid, key_version_ocid, vault_id):
